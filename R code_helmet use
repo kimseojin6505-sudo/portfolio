@@ -1,0 +1,563 @@
+library(haven)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(survey)
+library(broom)
+library(ggplot2)
+library(stringr)
+library(forcats)
+
+options(survey.lonely.psu = "adjust")
+
+
+df_raw <- read_sav("/Users/kimseojin/Desktop/Injury/kyrbs2024.sav")
+df_clean <- df_raw
+
+vars_needed <- c(
+  "I_HM_BICY","E_SES","E_S_RCRD","E_RES","SEX","GRADE",
+  "CTYPE_SD","M_STR","PA_VIG_D",
+  "WITH_PARENTS",
+  "CLUSTER","STRATA","W"
+)
+
+vars_exist <- intersect(vars_needed, names(df_clean))
+
+df <- df_clean %>%
+  dplyr::select(all_of(vars_exist)) %>%
+  na.omit()
+
+
+df <- df %>%
+  mutate(
+    I_HM_BICY = as.numeric(as.character(I_HM_BICY)),
+    
+    # bicycle use
+    bicycle_use = ifelse(I_HM_BICY %in% 2:5, 1, 0),
+    
+    # helmet non-use (⭐ 핵심)
+    helmet_nonuse = case_when(
+      I_HM_BICY %in% c(4,5) ~ 1,   # non-use = risk
+      I_HM_BICY %in% c(2,3) ~ 0
+    ),
+    
+    helmet_nonuse_f = factor(
+      helmet_nonuse,
+      levels = c(0,1),
+      labels = c("Use","Non-use")
+    ),
+    
+    ses = factor(E_SES, levels=1:5,
+                 labels=c("High","Middle-high","Middle","Middle-low","Low")),
+    
+    academic = factor(E_S_RCRD, levels=1:5,
+                      labels=c("Excellent","Above average","Average","Below average","Poor")),
+    
+    res_type = factor(E_RES, levels=1:5,
+                      labels=c("With family","With relatives",
+                               "Boarding/Independent","Dormitory",
+                               "Child welfare facility")),
+    
+    grade = factor(GRADE, levels=1:6,
+                   labels=c("Middle1","Middle2","Middle3","High1","High2","High3")),
+    
+    female = factor(ifelse(SEX == 2, "Female", "Male")),
+    
+    region = factor(CTYPE_SD,
+                    levels=c("대도시","중소도시","군지역"),
+                    labels=c("Metropolitan","Small/Medium city","Rural")),
+    
+    stress_bin = factor(ifelse(M_STR %in% c(1,2), 1, 0),
+                        levels=c(0,1),
+                        labels=c("Low stress","High stress")),
+    
+    vigorous_days = PA_VIG_D - 1,
+    
+    vigorous_bin = factor(ifelse(vigorous_days >= 2, 1, 0),
+                          levels=c(0,1),
+                          labels=c("0–1 days","2+ days"))
+  )
+
+if("WITH_PARENTS" %in% names(df)){
+  df <- df %>%
+    mutate(living_with_parents = factor(ifelse(WITH_PARENTS==1,"Yes","No")))
+}
+
+
+
+### survey design
+
+design_all <- svydesign(
+  id = ~CLUSTER,
+  strata = ~STRATA,
+  weights = ~W,
+  data = df,
+  nest = TRUE
+)
+
+df_riders <- df %>%
+  filter(bicycle_use == 1, !is.na(helmet_nonuse))
+
+design_riders <- svydesign(
+  id = ~CLUSTER,
+  strata = ~STRATA,
+  weights = ~W,
+  data = df_riders,
+  nest = TRUE
+)
+
+
+## weighted logistic regression
+
+formula_helmet <- helmet_nonuse ~
+  ses + academic + res_type + female + grade + region +
+  stress_bin + vigorous_bin
+
+if("living_with_parents" %in% names(df_riders)){
+  formula_helmet <- update(formula_helmet, . ~ . + living_with_parents)
+}
+
+model_helmet <- svyglm(
+  formula_helmet,
+  design = design_riders,
+  family = quasibinomial()
+)
+
+helmet_or <- tidy(model_helmet, conf.int=TRUE, exponentiate=TRUE)
+helmet_or
+
+
+
+## plot
+plot_data <- helmet_or %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    clean_term = case_when(
+      str_detect(term,"^ses") ~ str_replace(term,"^ses","SES: "),
+      str_detect(term,"^academic") ~ str_replace(term,"^academic","Academic: "),
+      str_detect(term,"^res_type") ~ str_replace(term,"^res_type","Residence: "),
+      str_detect(term,"^grade") ~ str_replace(term,"^grade","Grade: "),
+      str_detect(term,"^region") ~ str_replace(term,"^region","Region: "),
+      term=="femaleMale" ~ "Sex: Male",
+      term=="stress_binHigh stress" ~ "Stress: High",
+      term=="vigorous_bin2+ days" ~ "Vigorous PA: 2+ days",
+      TRUE ~ term
+    )
+  ) %>%
+  mutate(clean_term = fct_rev(factor(clean_term)))
+
+ggplot(plot_data, aes(x=clean_term, y=estimate)) +
+  geom_point(size=2.8) +
+  geom_errorbar(aes(ymin=conf.low, ymax=conf.high), width=0.15) +
+  geom_hline(yintercept=1, linetype="dashed") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(
+    title="Risk Factors for Helmet Non-use Among Adolescent Cyclists",
+    y="Odds Ratio (log scale, 95% CI)",
+    x=NULL
+  ) +
+  theme_minimal(base_size=13)
+
+
+
+
+###############################
+### Statistics #############
+
+# Weighted prevalence of bicycle use
+svymean(~bicycle_use, design_all, na.rm = TRUE)
+
+# Weighted prevalence of helmet non-use among riders
+svymean(~helmet_nonuse, design_riders, na.rm = TRUE)
+
+#Statistics Table
+make_table1_var <- function(var, design_obj, df_obj, outcome_var = "helmet_nonuse_f") {
+  
+  # 1) Unweighted counts
+  n_tab <- df_obj %>%
+    count(.data[[var]], .data[[outcome_var]], name = "n") %>%
+    rename(Category = 1, Outcome = 2)
+  
+  # 2) Weighted percentages
+  prop_tab <- svytable(
+    as.formula(paste0("~", var, " + ", outcome_var)),
+    design_obj
+  ) %>%
+    prop.table(margin = 2) %>%
+    as.data.frame()
+  
+  names(prop_tab) <- c("Category", "Outcome", "Percent")
+  prop_tab <- prop_tab %>% mutate(Percent = Percent * 100)
+  
+  # 3) Merge
+  out <- n_tab %>%
+    left_join(prop_tab, by = c("Category", "Outcome")) %>%
+    mutate(value = sprintf("%d (%.1f)", n, Percent)) %>%
+    dplyr::select(Category, Outcome, value) %>%
+    pivot_wider(names_from = Outcome, values_from = value)
+  
+  # 4) Rao–Scott p-value
+  p <- svychisq(
+    as.formula(paste0("~", var, " + ", outcome_var)),
+    design_obj
+  )$p.value
+  
+  out$p_value <- ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+  out
+}
+
+
+vars_table1 <- c(
+  "female","grade","ses","academic",
+  "res_type","stress_bin","region","vigorous_bin"
+)
+
+if ("living_with_parents" %in% names(df_riders)) {
+  vars_table1 <- c(vars_table1, "living_with_parents")
+}
+
+
+
+table1_final <- table1_final %>%
+  mutate(
+    Variable = dplyr::recode(
+      Variable,
+      female = "Sex",
+      grade = "Grade",
+      ses = "Socioeconomic status",
+      academic = "Academic performance",
+      res_type = "Residence type",
+      stress_bin = "Stress level",
+      region = "Region",
+      vigorous_bin = "Vigorous physical activity",
+      living_with_parents = "Living with parents"
+    )
+  )
+
+
+print(table1_final, n = Inf)
+
+
+
+
+
+########
+# ============================================================
+# A) Regional differences in bicycle use and helmet non-use
+# ============================================================
+
+# --- A1) Weighted prevalence by region (bicycle use)
+prev_bicy_by_region <- svyby(
+  ~bicycle_use, ~region, design_all, svymean, na.rm = TRUE, vartype = c("se","ci")
+)
+prev_bicy_by_region
+
+# --- A2) Weighted chi-square: bicycle use vs region
+chisq_bicy_region <- suppressWarnings(
+  svychisq(~bicycle_use + region, design_all)
+)
+chisq_bicy_region
+
+# --- A3) Weighted prevalence by region (helmet non-use among riders)
+prev_helmet_nonuse_by_region <- svyby(
+  ~helmet_nonuse, ~region, design_riders, svymean, na.rm = TRUE, vartype = c("se","ci")
+)
+prev_helmet_nonuse_by_region
+
+# --- A4) Weighted chi-square: helmet non-use vs region (among riders)
+chisq_helmet_region <- suppressWarnings(
+  svychisq(~helmet_nonuse_f + region, design_riders)
+)
+chisq_helmet_region
+
+
+# ============================================================
+# B) Multivariable logistic regression (helmet non-use)
+# ============================================================
+
+formula_helmet <- helmet_nonuse ~
+  ses + academic + res_type + female + grade + region + stress_bin + vigorous_bin
+
+if("living_with_parents" %in% names(df_riders)){
+  formula_helmet <- update(formula_helmet, . ~ . + living_with_parents)
+}
+
+model_helmet <- svyglm(
+  formula_helmet,
+  design = design_riders,
+  family = quasibinomial()
+)
+
+helmet_or <- broom::tidy(model_helmet, conf.int=TRUE, exponentiate=TRUE)
+helmet_or
+
+# (선택) 결과를 보기 좋게 정리
+helmet_or_clean <- helmet_or %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term_clean = case_when(
+      str_detect(term,"^ses") ~ str_replace(term,"^ses","SES: "),
+      str_detect(term,"^academic") ~ str_replace(term,"^academic","Academic: "),
+      str_detect(term,"^res_type") ~ str_replace(term,"^res_type","Residence: "),
+      str_detect(term,"^grade") ~ str_replace(term,"^grade","Grade: "),
+      str_detect(term,"^region") ~ str_replace(term,"^region","Region: "),
+      term=="femaleMale" ~ "Sex: Male",
+      term=="stress_binHigh stress" ~ "Stress: High",
+      term=="vigorous_bin2+ days" ~ "Vigorous PA: 2+ days",
+      term=="living_with_parentsNo" ~ "Living with parents: No",
+      TRUE ~ term
+    )
+  )
+
+helmet_or_clean
+
+
+# ============================================================
+# C) Forest plot (helmet non-use model)
+# ============================================================
+
+plot_data <- helmet_or_clean %>%
+  mutate(term_clean = fct_rev(factor(term_clean)))
+
+ggplot(plot_data, aes(x = term_clean, y = estimate)) +
+  geom_point(size=2.7) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width=0.15) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(
+    title = "Survey-weighted Odds Ratios for Helmet Non-use (Among Bicycle Riders)",
+    x = NULL,
+    y = "Odds Ratio (log scale, 95% CI)"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+############################################################
+# Table 1. Regional differences in bicycle use & helmet non-use
+############################################################
+
+## (A) Bicycle use by region 
+tab_bicy_region <- svyby(
+  ~bicycle_use,
+  ~region,
+  design_all,
+  svymean,
+  vartype = c("ci"),
+  na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  mutate(
+    Outcome = "Bicycle use",
+    Percent = bicycle_use * 100,
+    CI = sprintf("(%.1f–%.1f)", ci_l * 100, ci_u * 100),
+    Value = sprintf("%.1f %s", Percent, CI)
+  ) %>%
+  dplyr::select(Outcome, region, Value)
+
+p_bicy_region <- svychisq(
+  ~bicycle_use + region,
+  design_all
+)$p.value
+
+
+## (B) Helmet non-use by region 
+tab_helmet_region <- svyby(
+  ~helmet_nonuse,
+  ~region,
+  design_riders,
+  svymean,
+  vartype = c("ci"),
+  na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  mutate(
+    Outcome = "Helmet non-use",
+    Percent = helmet_nonuse * 100,
+    CI = sprintf("(%.1f–%.1f)", ci_l * 100, ci_u * 100),
+    Value = sprintf("%.1f %s", Percent, CI)
+  ) %>%
+  dplyr::select(Outcome, region, Value)
+
+p_helmet_region <- svychisq(
+  ~helmet_nonuse_f + region,
+  design_riders
+)$p.value
+
+
+## (C) Combine
+table_region <- bind_rows(tab_bicy_region, tab_helmet_region) %>%
+  pivot_wider(
+    names_from  = region,
+    values_from = Value
+  ) %>%
+  mutate(
+    p_value = c(
+      sprintf("%.3f", p_bicy_region),
+      sprintf("%.3f", p_helmet_region)
+    )
+  )
+
+table_region
+
+
+
+
+############################################################
+# Table 2. Multivariable logistic regression (helmet non-use)
+############################################################
+
+table_logistic <- tidy(
+  model_helmet,
+  exponentiate = TRUE,
+  conf.int = TRUE
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR_CI = sprintf("%.2f (%.2f–%.2f)", estimate, conf.low, conf.high),
+    p_value = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)),
+    Variable = case_when(
+      str_detect(term,"^ses") ~ "Socioeconomic status",
+      str_detect(term,"^academic") ~ "Academic performance",
+      str_detect(term,"^res_type") ~ "Residence type",
+      str_detect(term,"^grade") ~ "Grade",
+      str_detect(term,"^region") ~ "Region",
+      term=="femaleMale" ~ "Sex",
+      term=="stress_binHigh stress" ~ "Stress level",
+      term=="vigorous_bin2+ days" ~ "Vigorous physical activity",
+      term=="living_with_parentsNo" ~ "Living with parents",
+      TRUE ~ term
+    ),
+    Category = str_remove(term, "^[a-zA-Z_]+")
+  ) %>%
+  dplyr::select(Variable, Category, OR_CI, p_value)
+
+table_logistic
+
+
+
+
+############################################################
+# Export all result tables to Excel (multiple sheets)
+############################################################
+library(openxlsx)
+
+# 
+wb <- createWorkbook()
+
+# ---------------------------------------------------------
+# Sheet 1. Table 1 – Descriptive characteristics (riders)
+# ---------------------------------------------------------
+addWorksheet(wb, "Table1_Descriptive_Riders")
+writeData(wb, "Table1_Descriptive_Riders", table1_final)
+
+# ---------------------------------------------------------
+# Sheet 2. Regional differences (prevalence + chi-square)
+# ---------------------------------------------------------
+addWorksheet(wb, "Table2_Regional_Differences")
+writeData(wb, "Table2_Regional_Differences", table_region)
+
+# ---------------------------------------------------------
+# Sheet 3. Multivariable logistic regression
+# ---------------------------------------------------------
+addWorksheet(wb, "Table3_Logistic_HelmetNonuse")
+writeData(wb, "Table3_Logistic_HelmetNonuse", table_logistic)
+
+# ---------------------------------------------------------
+# Sheet 4. Rao–Scott chi-square test results (Supplementary)
+# ---------------------------------------------------------
+addWorksheet(wb, "TableS1_ChiSquare")
+writeData(wb, "TableS1_ChiSquare", table_chisq)
+
+# ---------------------------------------------------------
+# (선택) 상세 OR 결과 (appendix용)
+# ---------------------------------------------------------
+if (exists("helmet_or_clean")) {
+  addWorksheet(wb, "Appendix_OR_Detail")
+  writeData(wb, "Appendix_OR_Detail", helmet_or_clean)
+}
+
+# ---------------------------------------------------------
+# save
+# ---------------------------------------------------------
+saveWorkbook(
+  wb,
+  file = "KYRBS_2024_Bicycle_Helmet_Results.xlsx",
+  overwrite = TRUE
+)
+
+
+# ============================================================
+# Region × Grade interaction model
+# Outcome: Helmet non-use (1 = non-use)
+# Sample: Bicycle users only
+# ============================================================
+
+formula_interaction <- helmet_nonuse ~
+  grade * region +
+  ses +
+  academic +
+  res_type +
+  female +
+  stress_bin +
+  vigorous_bin
+
+# living_with_parents add
+if ("living_with_parents" %in% names(df_riders)) {
+  formula_interaction <- update(
+    formula_interaction,
+    . ~ . + living_with_parents
+  )
+}
+
+model_region_grade_interaction <- svyglm(
+  formula_interaction,
+  design = design_riders,
+  family = quasibinomial()
+)
+
+
+
+interaction_or <- broom::tidy(
+  model_region_grade_interaction,
+  exponentiate = TRUE,
+  conf.int = TRUE
+)
+
+interaction_or
+
+
+interaction_table <- interaction_or %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR_CI = sprintf(
+      "%.2f (%.2f–%.2f)",
+      estimate, conf.low, conf.high
+    ),
+    p_value = ifelse(
+      p.value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p.value)
+    ),
+    Variable = case_when(
+      str_detect(term, "grade:region") ~ "Grade × Region",
+      str_detect(term, "^grade") ~ "Grade",
+      str_detect(term, "^region") ~ "Region",
+      str_detect(term, "^ses") ~ "Socioeconomic status",
+      str_detect(term, "^academic") ~ "Academic performance",
+      str_detect(term, "^res_type") ~ "Residence type",
+      term == "femaleMale" ~ "Sex",
+      term == "stress_binHigh stress" ~ "Stress level",
+      term == "vigorous_bin2+ days" ~ "Vigorous physical activity",
+      term == "living_with_parentsNo" ~ "Living with parents",
+      TRUE ~ term
+    )
+  ) %>%
+  dplyr::select(Variable, term, OR_CI, p_value)
+
+interaction_table
+
+View(interaction_table)
